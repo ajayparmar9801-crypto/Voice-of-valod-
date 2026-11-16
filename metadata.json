@@ -1,0 +1,6 @@
+{
+  "name": "Voice of Valod News - 11-Agent Autonomous Newsroom",
+  "description": "Voice of Valod News - Full-cycle 11-agent autonomous newsroom pipeline with Anchor Maya (માયા), verified fact-checking, bilingual Gujarati support, Telegram Bot alerts, and multi-channel publishing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

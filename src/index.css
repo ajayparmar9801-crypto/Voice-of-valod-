@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+@layer base {
+  html,
+  body {
+    overflow-x: hidden;
+    background-color: #020617;
+  }
+}
+
+@keyframes news-marquee {
+  0% {
+    transform: translateX(0%);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.animate-news-marquee {
+  display: inline-flex;
+  white-space: nowrap;
+  will-change: transform;
+  animation: news-marquee 34s linear infinite;
+}
+
+.animate-news-marquee:hover {
+  animation-play-state: paused;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-news-marquee {
+    animation: none;
+  }
+}
