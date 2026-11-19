@@ -4,7 +4,7 @@ import fs from 'fs';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 
 dotenv.config();
@@ -15,7 +15,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // Shared server-side Gemini instance
 const ai = new GoogleGenAI({
@@ -2148,6 +2148,755 @@ Return JSON with:
     hashtags: Array.isArray(parsed?.hashtags) ? parsed.hashtags : ['#VoiceOfValod', '#ValodNews', '#TapiNews', '#Vyara', '#GujaratNews', '#BreakingNews'],
     slides
   });
+});
+
+// 3r-bis. API: Multi-Engine News Studio AI Video Generation (Google Gemini Free-Tier API, ChatGPT Workflow, OpenArt AI & FFmpeg MP4 Muxer)
+const STUDIO_RENDER_DIR = '/tmp/vov_studio_renders';
+try {
+  fs.mkdirSync(STUDIO_RENDER_DIR, { recursive: true });
+} catch {}
+
+// Helper: clean up stale rendered MP4s older than 30 minutes
+const cleanupOldStudioRenders = () => {
+  try {
+    const files = fs.readdirSync(STUDIO_RENDER_DIR);
+    const now = Date.now();
+    for (const file of files) {
+      const fullPath = path.join(STUDIO_RENDER_DIR, file);
+      const stat = fs.statSync(fullPath);
+      if (now - stat.mtimeMs > 30 * 60 * 1000) {
+        fs.rmSync(fullPath, { recursive: true, force: true });
+      }
+    }
+  } catch {}
+};
+
+// Engine 1: Google Gemini Free-Tier Studio Producer (gemini-4-hydrogen + gemini-3.8-flash-lite-tts)
+app.post('/api/studio/ai-video/gemini', async (req, res) => {
+  const {
+    titleGujarati = '',
+    titleEnglish = '',
+    scriptGujarati = '',
+    location = 'વાલોડ, તાપી',
+    category = 'Valod & Tapi',
+    aspectRatio = '16:9',
+    durationSeconds = 65,
+    hasCustomPhoto = false,
+    generateAudio = true
+  } = req.body || {};
+
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(400).json({
+      success: false,
+      code: 'MISSING_GEMINI_API_KEY',
+      error: 'GEMINI_API_KEY is not configured in Settings > Secrets.',
+      messageGu: 'Google Gemini ચલાવવા માટે Settings > Secrets માં GEMINI_API_KEY ઉમેરો.'
+    });
+  }
+
+  try {
+    const prompt = `You are the Lead News Video Producer for "Voice of Valod News" (@voiceofvalod) featuring Anchor Maya (માયા).
+Create a complete ${durationSeconds}-second broadcast video production package (${aspectRatio}) using free-tier Gemini models.
+
+News Headline (Gujarati): "${titleGujarati}"
+News Headline (English): "${titleEnglish}"
+Location: "${location}"
+Category: "${category}"
+Base Script Notes: "${scriptGujarati}"
+
+Produce:
+1. youtubeTitle: catchy Gujarati/English SEO YouTube title <= 90 chars.
+2. youtubeDescriptionGu: engaging Gujarati YouTube description with Voice of Valod (@voiceofvalod) & Zentrix Digital credits and WhatsApp +91 9426249922.
+3. hashtags: array of 6 hashtags (e.g. #Valod, #Tapi, #GujaratNews, #VoiceOfValod).
+4. voiceoverScript: natural, warm Gujarati news anchor voiceover script spoken by Anchor Maya (~110-140 words for clear narration, NO brackets or stage directions).
+5. slides: array of 4 broadcast scenes, each with:
+   - paragraphGu: crisp Gujarati on-screen narrative sentence for that scene
+   - captionGu: short 5-7 word Gujarati breaking lower-third headline
+   - visualTheme: one of "newsroom", "agriculture", "infrastructure", "weather", "community"
+   - visualLabelGu: short Gujarati visual tag (e.g. "પ્રતીકાત્મક દ્રશ્ય: વાલોડ")
+   - visualPromptEn: cinematic English scene prompt describing visuals cleanly`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: prompt,
+      config: {
+        systemInstruction: 'Return strictly valid JSON following the requested schema. Keep Gujarati natural and newsroom-accurate.',
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            youtubeTitle: { type: Type.STRING },
+            youtubeDescriptionGu: { type: Type.STRING },
+            hashtags: { type: Type.ARRAY, items: { type: Type.STRING } },
+            voiceoverScript: { type: Type.STRING },
+            slides: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  paragraphGu: { type: Type.STRING },
+                  captionGu: { type: Type.STRING },
+                  visualTheme: { type: Type.STRING },
+                  visualLabelGu: { type: Type.STRING },
+                  visualPromptEn: { type: Type.STRING }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    const parsed = JSON.parse((response.text || '{}').trim());
+    const slides = (Array.isArray(parsed.slides) ? parsed.slides : []).slice(0, 4).map((s: any, idx: number) => ({
+      id: idx + 1,
+      paragraphGu: s.paragraphGu || titleGujarati,
+      captionGu: s.captionGu || '🔴 વોઇસ ઓફ વાલોડ બ્રેકિંગ',
+      visualTheme: s.visualTheme || (idx === 0 ? 'newsroom' : 'infrastructure'),
+      visualLabelGu: s.visualLabelGu || `પ્રતીકાત્મક દ્રશ્ય #${idx + 1} • ${location}`,
+      visualPromptEn: s.visualPromptEn || `News broadcast visual for ${titleEnglish}`,
+      useCitizenPhoto: Boolean(hasCustomPhoto) && idx === 1,
+      durationSec: Math.max(5, Math.round(durationSeconds / 4))
+    }));
+
+    let audioWavBase64: string | null = null;
+    let ttsNotice: string | null = null;
+
+    if (generateAudio && parsed.voiceoverScript) {
+      try {
+        const ttsResponse = await ai.models.generateContent({
+          model: 'gemini-3.8-flash-lite-tts',
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: String(parsed.voiceoverScript).slice(0, 950),
+                  speechMetadata: {
+                    style: 'Clear, confident, warm news anchor speaking clearly'
+                  }
+                }
+              ]
+            }
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: 'Kore' }
+              }
+            }
+          }
+        });
+        const inlineAudio = ttsResponse.candidates?.[0]?.content?.parts?.find(
+          (p: any) => p.inlineData?.data
+        )?.inlineData?.data;
+        if (inlineAudio) {
+          audioWavBase64 = inlineAudio;
+        }
+      } catch (ttsErr: any) {
+        ttsNotice = ttsErr?.message || 'Gemini TTS unavailable for this request; using browser Anchor Maya voiceover fallback.';
+      }
+    }
+
+    return res.json({
+      success: true,
+      engine: 'gemini',
+      modelsUsed: audioWavBase64
+        ? ['gemini-4-hydrogen', 'gemini-3.8-flash-lite-tts']
+        : ['gemini-4-hydrogen'],
+      youtubeTitle: parsed.youtubeTitle || `${titleGujarati} | Voice of Valod News`,
+      youtubeDescriptionGu: parsed.youtubeDescriptionGu || '',
+      hashtags: Array.isArray(parsed.hashtags) ? parsed.hashtags : ['#VoiceOfValod', '#ValodNews', '#Tapi', '#GujaratNews'],
+      voiceoverScript: parsed.voiceoverScript || scriptGujarati,
+      slides,
+      audioWavBase64,
+      audioMimeType: audioWavBase64 ? 'audio/wav' : null,
+      ttsNotice
+    });
+  } catch (err: any) {
+    console.error('Gemini studio video error:', err?.message || err);
+    return res.status(502).json({
+      success: false,
+      error: err?.message || 'Gemini API request failed',
+      messageGu: 'Google Gemini વિડિયો સ્ટોરીબોર્ડ બનાવવામાં API ક્ષતિ આવી. કૃપા કરીને GEMINI_API_KEY ચકાસો.'
+    });
+  }
+});
+
+// Engine 2: ChatGPT Workflow Powered by Google Gemini Free-Tier API (GEMINI_API_KEY — zero OpenAI API key required)
+app.post('/api/studio/ai-video/chatgpt', async (req, res) => {
+  const {
+    titleGujarati = '',
+    titleEnglish = '',
+    scriptGujarati = '',
+    location = 'વાલોડ, તાપી',
+    aspectRatio = '16:9',
+    mode = 'auto', // 'auto' | 'free_prompt' | 'gemini_api'
+    customScriptFromChatGPT = ''
+  } = req.body || {};
+
+  const geminiKey = (process.env.GEMINI_API_KEY || '').trim();
+  const hasGeminiKey = Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY');
+
+  // Strict honest check when user invokes direct Google Gemini API generation
+  if (mode === 'gemini_api' && !hasGeminiKey) {
+    return res.status(400).json({
+      success: false,
+      code: 'MISSING_GEMINI_API_KEY',
+      geminiKeyConfigured: false,
+      error: 'GEMINI_API_KEY is not configured in Settings > Secrets.',
+      messageGu: 'Google Gemini API ચલાવવા માટે Settings > Secrets માં ફ્રી GEMINI_API_KEY ઉમેરો.'
+    });
+  }
+
+  // Path A: User pasted a custom Gujarati/English script from Free ChatGPT web
+  if (customScriptFromChatGPT && String(customScriptFromChatGPT).trim().length > 15) {
+    const cleanText = String(customScriptFromChatGPT).trim();
+
+    if (hasGeminiKey) {
+      try {
+        const refinePrompt = `You are a Gujarati & English TV newsroom producer for "Voice of Valod News" (@voiceofvalod) with Anchor Maya.
+Take this ChatGPT news script and format it into a broadcast-ready ${aspectRatio} YouTube storyboard & metadata package:
+Headline (Gu): "${titleGujarati}"
+Location: "${location}"
+Pasted Script:
+"""
+${cleanText}
+"""
+
+Return JSON with:
+- youtubeTitle (<= 90 chars, Gujarati/English SEO)
+- youtubeDescriptionGu (engaging Gujarati YouTube description with Voice of Valod & Zentrix Digital credits)
+- hashtags (6 relevant tags)
+- voiceoverScript (clean Gujarati narration for Anchor Maya)
+- slides (array of 4 objects: paragraphGu, captionGu, visualTheme ["newsroom"|"agriculture"|"infrastructure"|"weather"|"community"], visualLabelGu)`;
+
+        const refineRes = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: refinePrompt,
+          config: {
+            systemInstruction: 'Return strictly valid JSON preserving all factual details from the pasted script.',
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                youtubeTitle: { type: Type.STRING },
+                youtubeDescriptionGu: { type: Type.STRING },
+                hashtags: { type: Type.ARRAY, items: { type: Type.STRING } },
+                voiceoverScript: { type: Type.STRING },
+                slides: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      paragraphGu: { type: Type.STRING },
+                      captionGu: { type: Type.STRING },
+                      visualTheme: { type: Type.STRING },
+                      visualLabelGu: { type: Type.STRING }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        });
+
+        const parsed = JSON.parse((refineRes.text || '{}').trim());
+        const slides = (Array.isArray(parsed.slides) ? parsed.slides : []).slice(0, 4).map((s: any, idx: number) => ({
+          id: idx + 1,
+          paragraphGu: s.paragraphGu || cleanText,
+          captionGu: s.captionGu || '🔴 ChatGPT x Gemini વોઇસ ઓફ વાલોડ',
+          visualTheme: s.visualTheme || (idx === 0 ? 'newsroom' : 'infrastructure'),
+          visualLabelGu: s.visualLabelGu || `ChatGPT સ્ક્રિપ્ટ દ્રશ્ય #${idx + 1} • ${location}`,
+          durationSec: 16
+        }));
+
+        let audioWavBase64: string | null = null;
+        let ttsNotice: string | null = null;
+        if (parsed.voiceoverScript) {
+          try {
+            const ttsResponse = await ai.models.generateContent({
+              model: 'gemini-3.8-flash-lite-tts',
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    {
+                      text: String(parsed.voiceoverScript).slice(0, 950),
+                      speechMetadata: {
+                        style: 'Clear, confident, warm news anchor speaking clearly'
+                      }
+                    }
+                  ]
+                }
+              ],
+              config: {
+                responseModalities: ['AUDIO'],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: 'Kore' }
+                  }
+                }
+              }
+            });
+            const inlineAudio = ttsResponse.candidates?.[0]?.content?.parts?.find(
+              (p: any) => p.inlineData?.data
+            )?.inlineData?.data;
+            if (inlineAudio) audioWavBase64 = inlineAudio;
+          } catch (ttsErr: any) {
+            ttsNotice = ttsErr?.message || 'Gemini TTS skipped; using studio audio fallback.';
+          }
+        }
+
+        return res.json({
+          success: true,
+          engine: 'chatgpt',
+          geminiKeyConfigured: true,
+          geminiPowered: true,
+          modelsUsed: audioWavBase64 ? ['gemini-4-hydrogen', 'gemini-3.8-flash-lite-tts'] : ['gemini-4-hydrogen'],
+          modeUsed: 'chatgpt_imported_script_gemini_enhanced',
+          voiceoverScript: parsed.voiceoverScript || cleanText,
+          slides,
+          youtubeTitle: parsed.youtubeTitle || `${titleGujarati} | Voice of Valod News`.slice(0, 95),
+          youtubeDescriptionGu: parsed.youtubeDescriptionGu || `🔴 વોઇસ ઓફ વાલોડ ન્યૂઝ\n\n${cleanText}\n\n📺 YouTube: https://www.youtube.com/@voiceofvalod\n#Valod #Tapi #GujaratNews #VoiceOfValod`,
+          hashtags: Array.isArray(parsed.hashtags) ? parsed.hashtags : ['#VoiceOfValod', '#Valod', '#Tapi', '#GujaratNews'],
+          audioWavBase64,
+          audioMimeType: audioWavBase64 ? 'audio/wav' : null,
+          ttsNotice
+        });
+      } catch (err: any) {
+        return res.status(502).json({
+          success: false,
+          geminiKeyConfigured: true,
+          error: err?.message || 'Gemini script compilation failed',
+          messageGu: 'ChatGPT સ્ક્રિપ્ટને Gemini API વડે પ્રોસેસ કરવામાં ક્ષતિ આવી: ' + (err?.message || 'Error')
+        });
+      }
+    }
+
+    // Without GEMINI_API_KEY configured yet, deterministically split the user's pasted ChatGPT lines into slides
+    const lines = cleanText
+      .split(/\n+/)
+      .map((l) => l.replace(/^\d+[\).\s-]*/, '').trim())
+      .filter((l) => l.length > 8);
+    const slides = (lines.length >= 2 ? lines : [cleanText]).slice(0, 4).map((p, idx) => ({
+      id: idx + 1,
+      paragraphGu: p,
+      captionGu: idx === 0 ? '🔴 ChatGPT x વોઇસ ઓફ વાલોડ' : (titleGujarati || 'બ્રેકિંગ ન્યૂઝ').slice(0, 44),
+      visualTheme: idx === 0 ? 'newsroom' : 'infrastructure',
+      visualLabelGu: `ChatGPT સ્ક્રિપ્ટ દ્રશ્ય #${idx + 1} • ${location}`,
+      durationSec: 16
+    }));
+
+    return res.json({
+      success: true,
+      engine: 'chatgpt',
+      geminiKeyConfigured: false,
+      geminiPowered: false,
+      modeUsed: 'chatgpt_imported_script',
+      voiceoverScript: cleanText,
+      slides,
+      youtubeTitle: `${titleGujarati || lines[0]} | Voice of Valod News`.slice(0, 95),
+      youtubeDescriptionGu: `🔴 વોઇસ ઓફ વાલોડ ન્યૂઝ\n\n${cleanText}\n\n📺 YouTube: https://www.youtube.com/@voiceofvalod\n#Valod #Tapi #GujaratNews #VoiceOfValod`,
+      hashtags: ['#VoiceOfValod', '#Valod', '#Tapi', '#GujaratNews']
+    });
+  }
+
+  // Path B: Direct Google Gemini API Generation (ChatGPT-style conversational news hook + Anchor Maya voiceover)
+  if (mode === 'gemini_api') {
+    try {
+      const geminiPrompt = `You are a Gujarati & English TV newsroom producer for "Voice of Valod News" (@voiceofvalod) featuring Anchor Maya.
+Write an engaging ChatGPT-style conversational Gujarati news bulletin (${aspectRatio}) with punchy hooks, YouTube metadata, and 4 scenes.
+
+Headline (Gujarati): "${titleGujarati}"
+Headline (English): "${titleEnglish}"
+Location: "${location}"
+Base Script Notes: "${scriptGujarati}"
+
+Return strictly valid JSON with:
+- youtubeTitle (<= 90 chars)
+- youtubeDescriptionGu (engaging Gujarati YouTube description with Voice of Valod & Zentrix Digital credits)
+- hashtags (array of 6 hashtags)
+- voiceoverScript (natural Gujarati anchor voiceover ~110 words, no stage directions)
+- slides (array of 4 objects with paragraphGu, captionGu, visualTheme ["newsroom"|"agriculture"|"infrastructure"|"weather"|"community"], visualLabelGu)`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: geminiPrompt,
+        config: {
+          systemInstruction: 'Return strictly valid JSON following the requested schema.',
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              youtubeTitle: { type: Type.STRING },
+              youtubeDescriptionGu: { type: Type.STRING },
+              hashtags: { type: Type.ARRAY, items: { type: Type.STRING } },
+              voiceoverScript: { type: Type.STRING },
+              slides: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    paragraphGu: { type: Type.STRING },
+                    captionGu: { type: Type.STRING },
+                    visualTheme: { type: Type.STRING },
+                    visualLabelGu: { type: Type.STRING }
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+
+      const parsed = JSON.parse((response.text || '{}').trim());
+
+      let audioWavBase64: string | null = null;
+      let ttsNotice: string | null = null;
+      if (parsed.voiceoverScript) {
+        try {
+          const ttsResponse = await ai.models.generateContent({
+            model: 'gemini-3.8-flash-lite-tts',
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    text: String(parsed.voiceoverScript).slice(0, 950),
+                    speechMetadata: {
+                      style: 'Clear, confident, warm news anchor speaking clearly'
+                    }
+                  }
+                ]
+              }
+            ],
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: 'Kore' }
+                }
+              }
+            }
+          });
+          const inlineAudio = ttsResponse.candidates?.[0]?.content?.parts?.find(
+            (p: any) => p.inlineData?.data
+          )?.inlineData?.data;
+          if (inlineAudio) {
+            audioWavBase64 = inlineAudio;
+          }
+        } catch (ttsErr: any) {
+          ttsNotice = ttsErr?.message || 'Gemini TTS unavailable; using browser fallback.';
+        }
+      }
+
+      const slides = (Array.isArray(parsed.slides) ? parsed.slides : []).slice(0, 4).map((s: any, idx: number) => ({
+        id: idx + 1,
+        paragraphGu: s.paragraphGu || titleGujarati,
+        captionGu: s.captionGu || '🔴 Gemini x વોઇસ ઓફ વાલોડ',
+        visualTheme: s.visualTheme || (idx === 0 ? 'newsroom' : 'infrastructure'),
+        visualLabelGu: s.visualLabelGu || `Gemini દ્રશ્ય #${idx + 1} • ${location}`,
+        durationSec: 16
+      }));
+
+      return res.json({
+        success: true,
+        engine: 'chatgpt',
+        geminiKeyConfigured: true,
+        geminiPowered: true,
+        modelsUsed: audioWavBase64 ? ['gemini-4-hydrogen', 'gemini-3.8-flash-lite-tts'] : ['gemini-4-hydrogen'],
+        modeUsed: 'gemini_4_hydrogen',
+        youtubeTitle: parsed.youtubeTitle || `${titleGujarati} | Voice of Valod News`,
+        youtubeDescriptionGu: parsed.youtubeDescriptionGu || '',
+        hashtags: Array.isArray(parsed.hashtags) ? parsed.hashtags : ['#VoiceOfValod', '#Valod', '#Tapi', '#GujaratNews'],
+        voiceoverScript: parsed.voiceoverScript || scriptGujarati,
+        slides,
+        audioWavBase64,
+        audioMimeType: audioWavBase64 ? 'audio/wav' : null,
+        ttsNotice
+      });
+    } catch (err: any) {
+      return res.status(502).json({
+        success: false,
+        geminiKeyConfigured: true,
+        error: err?.message || 'Google Gemini API request failed',
+        messageGu: 'Google Gemini API કોલમાં ક્ષતિ આવી: ' + (err?.message || 'Error')
+      });
+    }
+  }
+
+  // Path C: Free ChatGPT Prompt Composer (uses free-tier gemini-4-hydrogen when GEMINI_API_KEY is available, or clean base prompt)
+  let freePrompt = `Act as a Senior Gujarati News Anchor (Maya) for "Voice of Valod News".
+Write a 65-second engaging Gujarati news bulletin & 4-scene visual storyboard (${aspectRatio}) for:
+Headline: ${titleGujarati} (${titleEnglish})
+Location: ${location}
+
+Format:
+1. Opening Hook (15s)
+2. Key Facts & Local Impact (20s)
+3. Public/Farmer Reaction (15s)
+4. Subscribe CTA to @voiceofvalod (15s)
+Also give 1 cinematic video prompt I can generate as a background clip.`;
+
+  let geminiEnhancedPrompt = false;
+  if (hasGeminiKey) {
+    try {
+      const promptRes = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: `Create a concise, copy-ready prompt for chatgpt.com so a Gujarati news editor can generate a 4-part 65s video script (${aspectRatio}) about "${titleGujarati}" (${titleEnglish}) in ${location}. Return only the prompt text.`
+      });
+      if (promptRes.text && promptRes.text.trim().length > 30) {
+        freePrompt = promptRes.text.trim();
+        geminiEnhancedPrompt = true;
+      }
+    } catch {
+      // Keep clean base prompt on transient prompt-helper error
+    }
+  }
+
+  return res.json({
+    success: true,
+    engine: 'chatgpt',
+    geminiKeyConfigured: hasGeminiKey,
+    geminiPowered: geminiEnhancedPrompt,
+    modeUsed: 'free_chatgpt_web_prompt',
+    chatGptWebPrompt: freePrompt,
+    chatGptUrl: 'https://chatgpt.com/',
+    messageGu: 'પેઈડ API કી વગર વાપરવા માટે ફ્રી ChatGPT પ્રોમ્પ્ટ તૈયાર છે! કોપી કરીને ChatGPT માં રન કરો અને સ્ક્રિપ્ટ અહીં પેસ્ટ કરો.'
+  });
+});
+
+// Engine 3: OpenArt AI Free Prompt Composer (free-tier gemini-4-hydrogen)
+app.post('/api/studio/ai-video/openart-prompts', async (req, res) => {
+  const {
+    titleGujarati = '',
+    titleEnglish = '',
+    location = 'વાલોડ, તાપી',
+    category = 'Valod & Tapi',
+    aspectRatio = '16:9'
+  } = req.body || {};
+
+  const fallbackScenes = [
+    {
+      sceneNumber: 1,
+      titleGu: 'ન્યૂઝ સ્ટુડિયો ઓપનિંગ',
+      cameraMovement: 'Slow Dolly Push-In',
+      recommendedModel: 'OpenArt Video (Kling / Wan Free Tier)',
+      promptEn: `Modern Indian regional TV newsroom studio, dark navy and crimson glowing broadcast desk, virtual world map wall, warm key lighting, ultra-sharp broadcast photography, ${aspectRatio} aspect ratio`,
+      negativePromptEn: 'blurry text, distorted faces, watermark, low resolution'
+    },
+    {
+      sceneNumber: 2,
+      titleGu: 'સ્થાનિક વાલોડ / ગુજરાત દ્રશ્ય',
+      cameraMovement: 'Smooth Aerial Drone Pan',
+      recommendedModel: 'OpenArt Image-to-Video',
+      promptEn: `Cinematic daylight scene representing ${titleEnglish || category} in ${location} Gujarat India, clean modern documentary photography, natural sunlight, vibrant colors, ${aspectRatio}`,
+      negativePromptEn: 'cartoon, extra limbs, text overlay, blurry'
+    },
+    {
+      sceneNumber: 3,
+      titleGu: 'નાગરિક & વિકાસ પ્રતિક્રિયા',
+      cameraMovement: 'Medium Tracking Shot',
+      recommendedModel: 'OpenArt Video Generator',
+      promptEn: `Hopeful Indian rural & semi-urban community bustling market and modern infrastructure in South Gujarat, golden hour lighting, documentary film grain, ${aspectRatio}`,
+      negativePromptEn: 'dark moody horror, distorted hands, watermark'
+    },
+    {
+      sceneNumber: 4,
+      titleGu: 'બુલેટિન ક્લોઝિંગ શોટ',
+      cameraMovement: 'Steady Studio Pull-Back',
+      recommendedModel: 'OpenArt Motion Studio',
+      promptEn: `Clean dark-navy and gold broadcast graphics backdrop with subtle light streaks and earth globe, crisp studio depth of field, ${aspectRatio}`,
+      negativePromptEn: 'cluttered text, gibberish letters, pixelated'
+    }
+  ];
+
+  if (!process.env.GEMINI_API_KEY) {
+    return res.json({
+      success: true,
+      engine: 'openart',
+      aspectRatio,
+      openArtUrl: 'https://openart.ai/video',
+      scenes: fallbackScenes
+    });
+  }
+
+  try {
+    const prompt = `Generate 4 high-impact OpenArt AI video/image generation prompts for a Gujarati regional news bulletin (${aspectRatio}) about:
+Headline: "${titleGujarati}" (${titleEnglish})
+Location: "${location}"
+Category: "${category}"
+
+Return JSON with key "scenes" (array of 4 objects), each containing:
+- sceneNumber (1..4)
+- titleGu (short Gujarati scene title)
+- cameraMovement (e.g. "Slow Aerial Pan", "Studio Dolly In")
+- recommendedModel (e.g. "OpenArt Video / Kling / Wan")
+- promptEn (detailed photorealistic English prompt for OpenArt AI, no text in image)
+- negativePromptEn (clean negative prompt)`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: prompt,
+      config: {
+        systemInstruction: 'Return strictly valid JSON.',
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            scenes: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  sceneNumber: { type: Type.INTEGER },
+                  titleGu: { type: Type.STRING },
+                  cameraMovement: { type: Type.STRING },
+                  recommendedModel: { type: Type.STRING },
+                  promptEn: { type: Type.STRING },
+                  negativePromptEn: { type: Type.STRING }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    const parsed = JSON.parse((response.text || '{}').trim());
+    const scenes = Array.isArray(parsed.scenes) && parsed.scenes.length > 0 ? parsed.scenes : fallbackScenes;
+
+    return res.json({
+      success: true,
+      engine: 'openart',
+      aspectRatio,
+      openArtUrl: 'https://openart.ai/video',
+      scenes
+    });
+  } catch (err: any) {
+    return res.json({
+      success: true,
+      engine: 'openart',
+      aspectRatio,
+      openArtUrl: 'https://openart.ai/video',
+      scenes: fallbackScenes,
+      warning: err?.message
+    });
+  }
+});
+
+// Fast Server FFmpeg MP4 Studio Compiler (Combines HD Canvas PNG Frames + Real AI Audio into YouTube-Ready .mp4)
+app.post('/api/studio/ai-video/mux-mp4', (req, res) => {
+  cleanupOldStudioRenders();
+
+  const {
+    framesBase64 = [],
+    audioBase64 = null,
+    audioMimeType = 'audio/wav',
+    durationSeconds = 65,
+    width = 1280,
+    height = 720
+  } = req.body || {};
+
+  if (!Array.isArray(framesBase64) || framesBase64.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'At least one rendered PNG frame is required.'
+    });
+  }
+
+  const renderId = `vov_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  const workDir = path.join(STUDIO_RENDER_DIR, renderId);
+  const outPath = path.join(STUDIO_RENDER_DIR, `${renderId}.mp4`);
+
+  try {
+    fs.mkdirSync(workDir, { recursive: true });
+    const targetDuration = Math.max(10, Math.min(180, Number(durationSeconds) || 65));
+    const safeW = Number(width) % 2 === 0 ? Number(width) : Number(width) + 1;
+    const safeH = Number(height) % 2 === 0 ? Number(height) : Number(height) + 1;
+    const perFrameSec = Number((targetDuration / framesBase64.length).toFixed(2));
+
+    const framePaths: string[] = [];
+    framesBase64.slice(0, 6).forEach((dataUrl: string, idx: number) => {
+      const cleaned = String(dataUrl).replace(/^data:image\/\w+;base64,/, '');
+      const framePath = path.join(workDir, `frame_${idx}.png`);
+      fs.writeFileSync(framePath, Buffer.from(cleaned, 'base64'));
+      framePaths.push(framePath);
+    });
+
+    let audioInputPath: string | null = null;
+    if (audioBase64 && String(audioBase64).length > 100) {
+      const ext = String(audioMimeType).includes('mpeg') || String(audioMimeType).includes('mp3') ? 'mp3' : 'wav';
+      const cleanedAudio = String(audioBase64).replace(/^data:audio\/[\w.-]+;base64,/, '');
+      audioInputPath = path.join(workDir, `voiceover.${ext}`);
+      fs.writeFileSync(audioInputPath, Buffer.from(cleanedAudio, 'base64'));
+    }
+
+    // Build FFmpeg command combining looped HD PNG slides + real voiceover audio (or soft studio bed)
+    const inputsCmd = framePaths
+      .map((p) => `-framerate 2 -loop 1 -t ${perFrameSec} -i "${p}"`)
+      .join(' ');
+
+    const audioCmd = audioInputPath
+      ? `-stream_loop -1 -i "${audioInputPath}"`
+      : `-f lavfi -i "sine=frequency=196:duration=${targetDuration}"`;
+
+    const audioIndex = framePaths.length;
+    const filterChain =
+      framePaths
+        .map(
+          (_, idx) =>
+            `[${idx}:v]scale=${safeW}:${safeH}:force_original_aspect_ratio=decrease,pad=${safeW}:${safeH}:(ow-iw)/2:(oh-ih)/2,setsar=1[v${idx}]`
+        )
+        .join(';') +
+      `;${framePaths.map((_, idx) => `[v${idx}]`).join('')}concat=n=${framePaths.length}:v=1:a=0,fps=15,format=yuv420p[vout]`;
+
+    const audioFilter = audioInputPath
+      ? `-map ${audioIndex}:a -c:a aac -b:a 128k`
+      : `-map ${audioIndex}:a -af "volume=0.04" -c:a aac -b:a 96k`;
+
+    const ffmpegCmd = `ffmpeg -y ${inputsCmd} ${audioCmd} -filter_complex "${filterChain}" -map "[vout]" ${audioFilter} -c:v libx264 -preset ultrafast -tune stillimage -pix_fmt yuv420p -t ${targetDuration} -movflags +faststart "${outPath}"`;
+
+    execSync(ffmpegCmd, { timeout: 45000, stdio: 'pipe' });
+
+    const stat = fs.statSync(outPath);
+    try {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    } catch {}
+
+    return res.json({
+      success: true,
+      renderId,
+      downloadUrl: `/api/studio/ai-video/render/${renderId}`,
+      durationSeconds: targetDuration,
+      sizeBytes: stat.size,
+      hasRealVoiceover: Boolean(audioInputPath),
+      messageGu: `YouTube-રેડી ${targetDuration}s HD MP4 વિડિયો (${(stat.size / (1024 * 1024)).toFixed(2)} MB) સફળતાપૂર્વક તૈયાર થયો છે!`
+    });
+  } catch (err: any) {
+    console.error('FFmpeg studio mux error:', err?.message || err);
+    try {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    } catch {}
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'FFmpeg MP4 compilation failed',
+      messageGu: 'MP4 વિડિયો કમ્પાઇલ કરવામાં ટેકનિકલ ક્ષતિ આવી.'
+    });
+  }
+});
+
+app.get('/api/studio/ai-video/render/:renderId', (req, res) => {
+  const safeId = String(req.params.renderId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  const outPath = path.join(STUDIO_RENDER_DIR, `${safeId}.mp4`);
+  if (!safeId || !fs.existsSync(outPath)) {
+    return res.status(404).json({ success: false, error: 'Rendered video expired or not found.' });
+  }
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', `inline; filename="VoiceOfValod_Studio_${safeId}.mp4"`);
+  return fs.createReadStream(outPath).pipe(res);
 });
 
 // 3s. API: Site Traffic & Visitor Analytics Tracker (persisted to /tmp/vov_traffic_stats.json)

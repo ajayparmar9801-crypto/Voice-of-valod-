@@ -30,7 +30,10 @@ import {
   Lock,
   Save,
   CheckCircle2,
-  Loader2
+  Loader2,
+  Bot,
+  Palette,
+  FileVideo
 } from 'lucide-react';
 import { Language, NewsFeedItem, PipelineState } from '../types';
 
@@ -93,6 +96,7 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stageCanvasRef = useRef<HTMLCanvasElement>(null);
   const citizenPhotoImgRef = useRef<HTMLImageElement | null>(null);
+  const customSlideImagesRef = useRef<Record<number, HTMLImageElement>>({});
   const logoImgRef = useRef<HTMLImageElement | null>(null);
 
   // Content data from Agent 4 & Agent 5
@@ -175,6 +179,34 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
   } | null>(null);
   const [copiedYouTubeLink, setCopiedYouTubeLink] = useState(false);
   const [copiedOrigin, setCopiedOrigin] = useState(false);
+
+  // Multi-Engine AI Video Studio State (Google Gemini Free API, ChatGPT + Gemini Studio, OpenArt AI)
+  const [aiVideoEngine, setAiVideoEngine] = useState<'gemini' | 'chatgpt' | 'openart'>('gemini');
+  const [isGeneratingAiVideo, setIsGeneratingAiVideo] = useState(false);
+  const [aiVideoStageMsg, setAiVideoStageMsg] = useState('');
+  const [aiVideoError, setAiVideoError] = useState<string | null>(null);
+  const [aiVideoSuccessMsg, setAiVideoSuccessMsg] = useState<string | null>(null);
+  const [aiVoiceAudioBase64, setAiVoiceAudioBase64] = useState<string | null>(null);
+  const [aiVoiceAudioMime, setAiVoiceAudioMime] = useState<string | null>(null);
+  const [aiVoiceAudioUrl, setAiVoiceAudioUrl] = useState<string | null>(null);
+  const [renderedVideoPreviewUrl, setRenderedVideoPreviewUrl] = useState<string | null>(null);
+  const [previewViewMode, setPreviewViewMode] = useState<'canvas' | 'rendered_video'>('canvas');
+  const [chatGptWebPrompt, setChatGptWebPrompt] = useState<string>('');
+  const [chatGptPastedScript, setChatGptPastedScript] = useState<string>('');
+  const [copiedChatGptPrompt, setCopiedChatGptPrompt] = useState(false);
+  const [openArtScenes, setOpenArtScenes] = useState<
+    Array<{
+      sceneNumber: number;
+      titleGu: string;
+      cameraMovement: string;
+      recommendedModel: string;
+      promptEn: string;
+      negativePromptEn: string;
+    }>
+  >([]);
+  const [copiedOpenArtScene, setCopiedOpenArtScene] = useState<number | null>(null);
+  const [openArtSlideImageNames, setOpenArtSlideImageNames] = useState<string[]>([]);
+  const [importedExternalVideoName, setImportedExternalVideoName] = useState<string | null>(null);
 
   // Storyboard slides & YouTube metadata state
   const buildFallbackSlides = (): StoryboardSlide[] => {
@@ -285,6 +317,13 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
     setGeneratedVideoBlob(null);
     setUploadedYouTubeVideo(null);
     setYoutubeUploadError(null);
+    setRenderedVideoPreviewUrl(null);
+    setPreviewViewMode('canvas');
+    setAiVoiceAudioBase64(null);
+    setAiVoiceAudioMime(null);
+    setAiVoiceAudioUrl(null);
+    setAiVideoError(null);
+    setAiVideoSuccessMsg(null);
   }, [pipelineState.selectedTopic, selectedApprovedItem]);
 
   // Preload Google Identity Services script cleanly on mount
@@ -855,7 +894,21 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
     ctx.scale(kbScale, kbScale);
     ctx.translate(-width / 2, -height / 2);
 
-    if (slide.useCitizenPhoto && citizenPhotoImgRef.current && citizenPhotoImgRef.current.complete) {
+    const customSlideImg = customSlideImagesRef.current[slideIdx];
+    if (customSlideImg && customSlideImg.complete && customSlideImg.naturalWidth > 0) {
+      const imgAspect = customSlideImg.naturalWidth / Math.max(1, customSlideImg.naturalHeight);
+      const canvasAspect = width / height;
+      let drawW = width;
+      let drawH = height;
+      if (imgAspect > canvasAspect) {
+        drawW = height * imgAspect;
+      } else {
+        drawH = width / imgAspect;
+      }
+      ctx.drawImage(customSlideImg, (width - drawW) / 2, (height - drawH) / 2, drawW, drawH);
+      ctx.fillStyle = 'rgba(2, 6, 23, 0.45)';
+      ctx.fillRect(-60, -60, width + 120, height + 120);
+    } else if (slide.useCitizenPhoto && citizenPhotoImgRef.current && citizenPhotoImgRef.current.complete) {
       const img = citizenPhotoImgRef.current;
       const imgAspect = img.naturalWidth / Math.max(1, img.naturalHeight);
       const canvasAspect = width / height;
@@ -1141,7 +1194,7 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
 
   // Live Interactive Ken Burns Preview Canvas Loop
   useEffect(() => {
-    if (activeMediaTab !== 'video') return;
+    if (activeMediaTab !== 'video' || previewViewMode !== 'canvas') return;
     const canvas = stageCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -1172,7 +1225,7 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
 
     rafId = requestAnimationFrame(animate);
     return () => cancelAnimationFrame(rafId);
-  }, [activeMediaTab, activeSlideIndex, slides, aspectRatio, activeHeadlineGu, activeLocation, activeAccuracy]);
+  }, [activeMediaTab, previewViewMode, openArtSlideImageNames, activeSlideIndex, slides, aspectRatio, activeHeadlineGu, activeLocation, activeAccuracy]);
 
   // Generate & Download Video (.webm/.mp4) recording animated Ken Burns slideshow + audio stream
   const recordAndExportVideo = async (targetRatio: '16:9' | '9:16' = aspectRatio === '9:16' ? '9:16' : '16:9') => {
@@ -1201,10 +1254,27 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
       const gain = audioCtx.createGain();
       osc.type = 'triangle';
       osc.frequency.setValueAtTime(220, audioCtx.currentTime);
-      gain.gain.setValueAtTime(0.02, audioCtx.currentTime);
+      gain.gain.setValueAtTime(aiVoiceAudioBase64 ? 0.004 : 0.02, audioCtx.currentTime);
       osc.connect(gain);
       gain.connect(dest);
       osc.start();
+
+      // If real Gemini / ChatGPT AI TTS audio was generated, pipe it directly into MediaRecorder audio track
+      if (aiVoiceAudioBase64) {
+        try {
+          const binaryStr = atob(aiVoiceAudioBase64);
+          const bytes = new Uint8Array(binaryStr.length);
+          for (let i = 0; i < binaryStr.length; i++) {
+            bytes[i] = binaryStr.charCodeAt(i);
+          }
+          const decodedBuffer = await audioCtx.decodeAudioData(bytes.buffer.slice(0));
+          const voiceSource = audioCtx.createBufferSource();
+          voiceSource.buffer = decodedBuffer;
+          voiceSource.loop = decodedBuffer.duration < targetDurationSec;
+          voiceSource.connect(dest);
+          voiceSource.start();
+        } catch {}
+      }
 
       // Trigger SpeechSynthesis narration synced to recording
       const activeSlides = slides.length > 0 ? slides : buildFallbackSlides();
@@ -1316,6 +1386,323 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
     }
   };
 
+  // Helper: Capture HD PNG keyframes for slides & compile fast YouTube-ready .mp4 via FFmpeg
+  const compileSlidesAndAudioToMp4 = async (
+    targetSlides: StoryboardSlide[],
+    audioB64: string | null,
+    audioMime: string | null,
+    engineLabel: string
+  ) => {
+    const targetRatio: '16:9' | '9:16' = aspectRatio === '9:16' ? '9:16' : '16:9';
+    const width = targetRatio === '16:9' ? 1280 : 720;
+    const height = targetRatio === '16:9' ? 720 : 1280;
+    const targetDuration = videoDurationMode === '65s' ? 65 : 20;
+
+    setAiVideoStageMsg(
+      isGu ? `HD બ્રોડકાસ્ટ સ્લાઇડ્સ રેન્ડર થઈ રહી છે (${targetSlides.length} દ્રશ્યો)...` : `Rendering ${targetSlides.length} HD broadcast frames...`
+    );
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = width;
+    offscreen.height = height;
+    const ctx = offscreen.getContext('2d');
+    if (!ctx) throw new Error('Canvas context unavailable');
+
+    const framesBase64 = targetSlides.slice(0, 6).map((slide, idx) => {
+      drawBroadcastFrame(
+        ctx,
+        width,
+        height,
+        slide,
+        idx,
+        targetSlides.length,
+        0.35,
+        (idx + 1) * 24,
+        targetRatio
+      );
+      return offscreen.toDataURL('image/png');
+    });
+
+    setAiVideoStageMsg(
+      isGu ? `FFmpeg દ્વારા ${targetDuration}s YouTube-રેડી MP4 વિડિયો બની રહ્યો છે...` : `Compiling ${targetDuration}s YouTube-ready MP4 video...`
+    );
+
+    const muxRes = await fetch('/api/studio/ai-video/mux-mp4', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        framesBase64,
+        audioBase64: audioB64,
+        audioMimeType: audioMime || 'audio/wav',
+        durationSeconds: targetDuration,
+        width,
+        height
+      })
+    });
+    const muxData = await muxRes.json();
+    if (!muxRes.ok || !muxData?.success || !muxData.downloadUrl) {
+      throw new Error(muxData?.messageGu || muxData?.error || 'Failed to compile MP4');
+    }
+
+    const blobRes = await fetch(muxData.downloadUrl);
+    const mp4Blob = await blobRes.blob();
+
+    setGeneratedVideoBlob(mp4Blob);
+    setGeneratedVideoMimeType('video/mp4');
+    setGeneratedVideoDuration(targetDuration);
+    setRenderedVideoPreviewUrl(URL.createObjectURL(mp4Blob));
+    setPreviewViewMode('rendered_video');
+    setUploadedYouTubeVideo(null);
+    setYoutubeUploadError(null);
+    setVideoDownloadSuccess(true);
+    setDurationVerified(true);
+    setAiVideoSuccessMsg(
+      isGu
+        ? `✅ ${engineLabel} દ્વારા ${targetDuration}s HD MP4 વિડિયો (${(mp4Blob.size / (1024 * 1024)).toFixed(2)} MB) YouTube પબ્લિશ માટે તૈયાર છે!`
+        : `✅ ${engineLabel} generated ${targetDuration}s HD MP4 (${(mp4Blob.size / (1024 * 1024)).toFixed(2)} MB) — ready to publish to YouTube!`
+    );
+  };
+
+  // Engine 1 Handler: Google Gemini Free API Video Maker (gemini-4-hydrogen + gemini-3.8-flash-lite-tts)
+  const handleGenerateGeminiVideo = async () => {
+    setIsGeneratingAiVideo(true);
+    setAiVideoError(null);
+    setAiVideoSuccessMsg(null);
+    setAiVideoStageMsg(
+      isGu ? 'Google Gemini (Free Tier) સ્ક્રિપ્ટ અને Anchor Maya વોઇસઓવર બનાવે છે...' : 'Generating script & Anchor Maya voiceover via free-tier Gemini...'
+    );
+
+    try {
+      const targetDuration = videoDurationMode === '65s' ? 65 : 20;
+      const res = await fetch('/api/studio/ai-video/gemini', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          titleGujarati: activeHeadlineGu,
+          titleEnglish: activeHeadlineEn,
+          scriptGujarati: activeScriptGu,
+          location: activeLocation,
+          category: activeCategory,
+          aspectRatio: aspectRatio === '9:16' ? '9:16' : '16:9',
+          durationSeconds: targetDuration,
+          hasCustomPhoto: Boolean(selectedApprovedItem?.photoDataUrl),
+          generateAudio: true
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.messageGu || data?.error || 'Gemini generation failed');
+      }
+
+      const nextSlides: StoryboardSlide[] = Array.isArray(data.slides) && data.slides.length > 0 ? data.slides : buildFallbackSlides();
+      setSlides(nextSlides);
+      setActiveSlideIndex(0);
+      if (data.youtubeTitle) setYoutubeTitle(data.youtubeTitle);
+      if (data.youtubeDescriptionGu) setYoutubeDescription(data.youtubeDescriptionGu);
+      if (Array.isArray(data.hashtags)) setYoutubeHashtags(data.hashtags);
+
+      let audioB64: string | null = null;
+      let audioMime: string | null = null;
+      if (data.audioWavBase64) {
+        audioB64 = data.audioWavBase64;
+        audioMime = data.audioMimeType || 'audio/wav';
+        setAiVoiceAudioBase64(audioB64);
+        setAiVoiceAudioMime(audioMime);
+        setAiVoiceAudioUrl(`data:${audioMime};base64,${audioB64}`);
+      } else {
+        setAiVoiceAudioBase64(null);
+        setAiVoiceAudioMime(null);
+        setAiVoiceAudioUrl(null);
+      }
+
+      await compileSlidesAndAudioToMp4(nextSlides, audioB64, audioMime, 'Google Gemini Studio');
+    } catch (err: any) {
+      setAiVideoError(err?.message || 'Gemini video creation failed');
+    } finally {
+      setIsGeneratingAiVideo(false);
+      setAiVideoStageMsg('');
+    }
+  };
+
+  // Engine 2 Handler: ChatGPT Workflow + Google Gemini Free-Tier API (GEMINI_API_KEY)
+  const handleRunChatGptEngine = async (mode: 'free_prompt' | 'gemini_api' | 'compile_pasted') => {
+    setIsGeneratingAiVideo(true);
+    setAiVideoError(null);
+    setAiVideoSuccessMsg(null);
+    setAiVideoStageMsg(
+      mode === 'gemini_api'
+        ? (isGu ? 'Google Gemini API સ્ક્રિપ્ટ અને વોઇસ બનાવે છે...' : 'Generating via Google Gemini API...')
+        : (isGu ? 'ChatGPT પ્રોમ્પ્ટ / સ્ક્રિપ્ટ પ્રોસેસ થાય છે...' : 'Processing ChatGPT News Studio workflow...')
+    );
+
+    try {
+      const res = await fetch('/api/studio/ai-video/chatgpt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          titleGujarati: activeHeadlineGu,
+          titleEnglish: activeHeadlineEn,
+          scriptGujarati: activeScriptGu,
+          location: activeLocation,
+          aspectRatio: aspectRatio === '9:16' ? '9:16' : '16:9',
+          mode: mode === 'compile_pasted' ? 'free_prompt' : mode,
+          customScriptFromChatGPT: mode === 'compile_pasted' ? chatGptPastedScript : ''
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.messageGu || data?.error || 'Studio generation request failed');
+      }
+
+      if (data.chatGptWebPrompt) {
+        setChatGptWebPrompt(data.chatGptWebPrompt);
+        setAiVideoSuccessMsg(
+          isGu
+            ? '✅ ફ્રી ChatGPT પ્રોમ્પ્ટ તૈયાર છે! કોપી કરીને ChatGPT માં પેસ્ટ કરો, પછી મળેલી સ્ક્રિપ્ટ નીચે પેસ્ટ કરી MP4 બનાવો.'
+            : '✅ Free ChatGPT prompt generated! Copy & run in ChatGPT, then paste the script below to compile MP4.'
+        );
+        return;
+      }
+
+      const nextSlides: StoryboardSlide[] = Array.isArray(data.slides) && data.slides.length > 0 ? data.slides : buildFallbackSlides();
+      setSlides(nextSlides);
+      setActiveSlideIndex(0);
+      if (data.youtubeTitle) setYoutubeTitle(data.youtubeTitle);
+      if (data.youtubeDescriptionGu) setYoutubeDescription(data.youtubeDescriptionGu);
+      if (Array.isArray(data.hashtags)) setYoutubeHashtags(data.hashtags);
+
+      const incomingAudio = data.audioWavBase64 || data.audioBase64 || null;
+      const incomingMime = data.audioMimeType || 'audio/wav';
+      const audioB64: string | null = incomingAudio || aiVoiceAudioBase64;
+      const audioMime: string | null = incomingAudio ? incomingMime : aiVoiceAudioMime;
+      if (incomingAudio) {
+        setAiVoiceAudioBase64(incomingAudio);
+        setAiVoiceAudioMime(incomingMime);
+        setAiVoiceAudioUrl(`data:${incomingMime};base64,${incomingAudio}`);
+      }
+
+      await compileSlidesAndAudioToMp4(
+        nextSlides,
+        audioB64,
+        audioMime,
+        data.geminiPowered ? 'ChatGPT x Google Gemini Studio' : 'ChatGPT Studio'
+      );
+    } catch (err: any) {
+      setAiVideoError(err?.message || 'ChatGPT studio failed');
+    } finally {
+      setIsGeneratingAiVideo(false);
+      setAiVideoStageMsg('');
+    }
+  };
+
+  // Engine 3 Handler: OpenArt AI Free Scene Prompt Generator & Media Importer
+  const handleGenerateOpenArtPrompts = async () => {
+    setIsGeneratingAiVideo(true);
+    setAiVideoError(null);
+    setAiVideoSuccessMsg(null);
+    setAiVideoStageMsg(isGu ? 'OpenArt AI માટે 4 સિનેમેટિક વિડિયો પ્રોમ્પ્ટ બને છે...' : 'Generating 4 OpenArt AI scene prompts...');
+
+    try {
+      const res = await fetch('/api/studio/ai-video/openart-prompts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          titleGujarati: activeHeadlineGu,
+          titleEnglish: activeHeadlineEn,
+          location: activeLocation,
+          category: activeCategory,
+          aspectRatio: aspectRatio === '9:16' ? '9:16' : '16:9'
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || 'Could not generate OpenArt prompts');
+      }
+      setOpenArtScenes(data.scenes || []);
+      setAiVideoSuccessMsg(
+        isGu
+          ? '✅ OpenArt AI માટે ૪ સિનેમેટિક પ્રોમ્પ્ટ તૈયાર છે! OpenArt પર જઈ ફ્રી વિડિયો/ચિત્રો બનાવો અને નીચે ઇમ્પોર્ટ કરી YouTube પર મૂકો.'
+          : '✅ Generated 4 OpenArt AI scene prompts! Create clips on OpenArt AI, import them below, and publish directly to YouTube.'
+      );
+    } catch (err: any) {
+      setAiVideoError(err?.message || 'OpenArt prompt error');
+    } finally {
+      setIsGeneratingAiVideo(false);
+      setAiVideoStageMsg('');
+    }
+  };
+
+  const handleImportExternalVideoFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setAiVideoError(null);
+    setGeneratedVideoBlob(file);
+    setGeneratedVideoMimeType(file.type || 'video/mp4');
+    setGeneratedVideoDuration(60);
+    setImportedExternalVideoName(file.name);
+    const objUrl = URL.createObjectURL(file);
+    setRenderedVideoPreviewUrl(objUrl);
+    setPreviewViewMode('rendered_video');
+    setUploadedYouTubeVideo(null);
+    setVideoDownloadSuccess(true);
+    setAiVideoSuccessMsg(
+      isGu
+        ? `✅ "${file.name}" (${(file.size / (1024 * 1024)).toFixed(2)} MB) સ્ટુડિયોમાં લોડ થઈ ગયો છે! હવે "🚀 Direct Upload to YouTube" પર ક્લિક કરી પબ્લિશ કરો.`
+        : `✅ Imported "${file.name}" (${(file.size / (1024 * 1024)).toFixed(2)} MB) into Studio! Click "Direct Upload to YouTube" below to publish.`
+    );
+  };
+
+  const handleImportOpenArtImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []).slice(0, 4);
+    if (files.length === 0) return;
+
+    setAiVideoError(null);
+    const loadedNames: string[] = [];
+
+    await Promise.all(
+      files.map(
+        (file, idx) =>
+          new Promise<void>((resolve) => {
+            loadedNames.push(file.name);
+            const reader = new FileReader();
+            reader.onload = () => {
+              const img = new Image();
+              img.src = String(reader.result || '');
+              img.onload = () => {
+                customSlideImagesRef.current[idx] = img;
+                resolve();
+              };
+              img.onerror = () => resolve();
+            };
+            reader.readAsDataURL(file);
+          })
+      )
+    );
+
+    setOpenArtSlideImageNames(loadedNames);
+    setPreviewViewMode('canvas');
+    setAiVideoSuccessMsg(
+      isGu
+        ? `✅ ${loadedNames.length} OpenArt AI ચિત્રો સ્લાઇડશોમાં ઉમેરાયા! હવે "🎬 OpenArt ચિત્રોમાંથી MP4 બનાવો" દબાવી YouTube વિડિયો બનાવો.`
+        : `✅ Loaded ${loadedNames.length} OpenArt AI visuals into slides! Click Compile MP4 below to build your YouTube bulletin.`
+    );
+  };
+
+  const handleCompileCurrentStudioToMp4 = async () => {
+    setIsGeneratingAiVideo(true);
+    setAiVideoError(null);
+    setAiVideoSuccessMsg(null);
+    try {
+      const currentSlides = slides.length > 0 ? slides : buildFallbackSlides();
+      await compileSlidesAndAudioToMp4(currentSlides, aiVoiceAudioBase64, aiVoiceAudioMime, 'News Studio Compiler');
+    } catch (err: any) {
+      setAiVideoError(err?.message || 'Compilation error');
+    } finally {
+      setIsGeneratingAiVideo(false);
+      setAiVideoStageMsg('');
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Sub Header Navigation */}
@@ -1416,6 +1803,356 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
         </div>
       )}
 
+      {/* AI MULTI-ENGINE VIDEO MAKER STUDIO (Google Gemini Free API • ChatGPT • OpenArt AI) */}
+      {activeMediaTab === 'video' && (
+        <section className="bg-gradient-to-br from-[#071528] via-slate-900 to-slate-950 border border-amber-500/40 rounded-2xl p-4 sm:p-5 shadow-xl space-y-4">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/40 text-emerald-300 text-[10px] font-bold uppercase tracking-wider">
+                  FREE TIER READY • NO PAID KEY REQUIRED
+                </span>
+                <span className="text-[11px] text-amber-300 font-semibold">
+                  YouTube @voiceofvalod Publisher
+                </span>
+              </div>
+              <h3 className="text-sm sm:text-base font-extrabold text-white font-['Noto_Sans_Gujarati',sans-serif]">
+                {isGu
+                  ? 'AI ન્યૂઝ વિડિયો મેકર સ્ટુડિયો (Google Gemini • ChatGPT • OpenArt AI)'
+                  : 'AI News Video Maker Studio (Google Gemini • ChatGPT • OpenArt AI)'}
+              </h3>
+            </div>
+
+            {/* 3-Engine Selector Tabs */}
+            <div className="grid grid-cols-3 gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
+              <button
+                type="button"
+                onClick={() => {
+                  setAiVideoEngine('gemini');
+                  setAiVideoError(null);
+                }}
+                className={`min-h-[38px] px-2.5 sm:px-3.5 py-1.5 rounded-lg font-bold flex items-center justify-center gap-1.5 transition ${
+                  aiVideoEngine === 'gemini'
+                    ? 'bg-gradient-to-r from-sky-600 to-indigo-600 text-white shadow'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">Gemini AI</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setAiVideoEngine('chatgpt');
+                  setAiVideoError(null);
+                }}
+                className={`min-h-[38px] px-2.5 sm:px-3.5 py-1.5 rounded-lg font-bold flex items-center justify-center gap-1.5 transition ${
+                  aiVideoEngine === 'chatgpt'
+                    ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Bot className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">ChatGPT</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setAiVideoEngine('openart');
+                  setAiVideoError(null);
+                }}
+                className={`min-h-[38px] px-2.5 sm:px-3.5 py-1.5 rounded-lg font-bold flex items-center justify-center gap-1.5 transition ${
+                  aiVideoEngine === 'openart'
+                    ? 'bg-gradient-to-r from-rose-600 to-amber-600 text-white shadow'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Palette className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">OpenArt AI</span>
+              </button>
+            </div>
+          </div>
+
+          {/* ENGINE 1: GOOGLE GEMINI (FREE API KEY WORKFLOW) */}
+          {aiVideoEngine === 'gemini' && (
+            <div className="space-y-3">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 bg-slate-950/75 border border-sky-500/30 rounded-xl p-3.5">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs font-bold text-sky-300">
+                      Google Gemini Studio (`gemini-4-hydrogen` + `gemini-3.8-flash-lite-tts` Voice + FFmpeg HD MP4)
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-300 font-['Noto_Sans_Gujarati',sans-serif] leading-relaxed">
+                    {isGu
+                      ? 'ફ્રી Gemini API કી થી એન્કર માયાની ગુજરાતી સ્ક્રિપ્ટ, વોઇસઓવર અને ૬૫-સેકન્ડનું YouTube-રેડી HD MP4 વિડિયો ફક્ત ૫ સેકન્ડમાં બનાવો (પેઈડ કીની જરૂર નથી).'
+                      : 'Uses free-tier Gemini models + FFmpeg HD compiler to produce a ready-to-publish YouTube MP4 news bulletin with Anchor Maya voiceover — zero paid API key needed.'}
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleGenerateGeminiVideo}
+                  disabled={isGeneratingAiVideo}
+                  className="min-h-[44px] px-5 py-2.5 rounded-xl bg-gradient-to-r from-sky-600 via-blue-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white text-xs sm:text-sm font-bold shadow-lg flex items-center justify-center gap-2 shrink-0 transition disabled:opacity-50"
+                >
+                  {isGeneratingAiVideo ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>{isGu ? 'વિડિયો બને છે...' : 'Creating Video...'}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Film className="w-4 h-4" />
+                      <span>{isGu ? '🎬 Gemini MP4 વિડિયો બનાવો' : '🎬 Make Gemini Video (.mp4)'}</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {aiVoiceAudioUrl && (
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                  <span className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
+                    <Volume2 className="w-4 h-4" />
+                    {isGu ? 'Gemini AI એન્કર માયા ઓડિયો:' : 'Gemini Anchor Maya Voiceover Track:'}
+                  </span>
+                  <audio controls src={aiVoiceAudioUrl} className="h-8 w-full sm:w-72" />
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ENGINE 2: CHATGPT + GOOGLE GEMINI API WORKFLOW */}
+          {aiVideoEngine === 'chatgpt' && (
+            <div className="space-y-3">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                <div className="bg-slate-950/80 border border-emerald-500/30 rounded-xl p-3.5 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-bold text-emerald-300">
+                      {isGu ? '૧) ફ્રી ChatGPT વેબ + Google Gemini API વર્કફ્લો' : '1) Free ChatGPT Web + Google Gemini API'}
+                    </span>
+                    <a
+                      href="https://chatgpt.com/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-[11px] font-bold text-sky-400 hover:underline flex items-center gap-1"
+                    >
+                      <span>Open chatgpt.com</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleRunChatGptEngine('free_prompt')}
+                      disabled={isGeneratingAiVideo}
+                      className="min-h-[38px] px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-200 text-xs font-bold transition disabled:opacity-50"
+                    >
+                      {isGu ? '✨ ફ્રી ChatGPT પ્રોમ્પ્ટ બનાવો' : '✨ Build ChatGPT Prompt'}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleRunChatGptEngine('gemini_api')}
+                      disabled={isGeneratingAiVideo}
+                      className="min-h-[38px] px-3 py-1.5 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 border border-sky-500/40 text-sky-200 text-xs font-bold transition disabled:opacity-50"
+                      title="Uses free-tier GEMINI_API_KEY from server Secrets"
+                    >
+                      {isGu ? '⚡ Google Gemini API થી ઓટો-વિડિયો' : '⚡ Auto-Make via Google Gemini API'}
+                    </button>
+                  </div>
+
+                  {chatGptWebPrompt && (
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between text-[11px] text-slate-400">
+                        <span>{isGu ? 'ChatGPT માં કોપી-પેસ્ટ કરો:' : 'Copy & paste into ChatGPT:'}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard.writeText(chatGptWebPrompt);
+                            setCopiedChatGptPrompt(true);
+                            setTimeout(() => setCopiedChatGptPrompt(false), 2000);
+                          }}
+                          className="text-amber-300 font-bold flex items-center gap-1"
+                        >
+                          {copiedChatGptPrompt ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                          <span>{copiedChatGptPrompt ? (isGu ? 'કોપી થયું' : 'Copied') : (isGu ? 'પ્રોમ્પ્ટ કોપી' : 'Copy Prompt')}</span>
+                        </button>
+                      </div>
+                      <pre className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-200 whitespace-pre-wrap max-h-28 overflow-y-auto font-mono">
+                        {chatGptWebPrompt}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+
+                <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 space-y-2.5">
+                  <span className="text-xs font-bold text-white block">
+                    {isGu ? '૨) ChatGPT સ્ક્રિપ્ટ પેસ્ટ કરો અથવા વિડિયો ઇમ્પોર્ટ કરો' : '2) Paste ChatGPT Script or Import Video'}
+                  </span>
+                  <textarea
+                    rows={3}
+                    value={chatGptPastedScript}
+                    onChange={(e) => setChatGptPastedScript(e.target.value)}
+                    placeholder={
+                      isGu
+                        ? 'ChatGPT માંથી મળેલી ૪ લાઇનની ગુજરાતી ન્યૂઝ સ્ક્રિપ્ટ અહીં પેસ્ટ કરો...'
+                        : 'Paste your 4-paragraph Gujarati news script from ChatGPT here...'
+                    }
+                    className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-white font-['Noto_Sans_Gujarati',sans-serif] focus:outline-none focus:border-emerald-500"
+                  />
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleRunChatGptEngine('compile_pasted')}
+                      disabled={isGeneratingAiVideo || chatGptPastedScript.trim().length < 15}
+                      className="flex-1 min-h-[40px] px-3 py-2 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 transition disabled:opacity-50"
+                    >
+                      <Film className="w-3.5 h-3.5" />
+                      <span>{isGu ? '🎬 ChatGPT સ્ક્રિપ્ટમાંથી MP4 બનાવો' : '🎬 Make MP4 from ChatGPT Script'}</span>
+                    </button>
+
+                    <label className="min-h-[40px] px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition">
+                      <FileVideo className="w-3.5 h-3.5 text-amber-400" />
+                      <span>{isGu ? 'MP4 ઇમ્પોર્ટ' : 'Import MP4'}</span>
+                      <input type="file" accept="video/*" onChange={handleImportExternalVideoFile} className="hidden" />
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ENGINE 3: OPENART AI FREE VIDEO & VISUAL WORKFLOW */}
+          {aiVideoEngine === 'openart' && (
+            <div className="space-y-3">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 bg-slate-950/80 border border-rose-500/35 rounded-xl p-3.5">
+                <div className="space-y-1">
+                  <span className="text-xs font-bold text-amber-300">
+                    OpenArt AI News Studio (Prompt Composer + Video / Image Importer)
+                  </span>
+                  <p className="text-xs text-slate-300 font-['Noto_Sans_Gujarati',sans-serif] leading-relaxed">
+                    {isGu
+                      ? 'OpenArt AI માટે ૪ ફ્રી સિનેમેટિક પ્રોમ્પ્ટ બનાવો, OpenArt પર વિડિયો/ચિત્રો જનરેટ કરો, અને અહીં ઇમ્પોર્ટ કરી YouTube (@voiceofvalod) પર પબ્લિશ કરો.'
+                      : 'Generate 4 tailored OpenArt AI scene prompts, create clips/visuals on OpenArt, and import your video or scene images right back here for YouTube publishing.'}
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={handleGenerateOpenArtPrompts}
+                    disabled={isGeneratingAiVideo}
+                    className="min-h-[40px] px-3.5 py-2 rounded-xl bg-gradient-to-r from-rose-600 to-amber-600 hover:from-rose-500 hover:to-amber-500 text-white text-xs font-bold shadow flex items-center gap-1.5 transition disabled:opacity-50"
+                  >
+                    <Wand2 className={`w-3.5 h-3.5 ${isGeneratingAiVideo ? 'animate-spin' : ''}`} />
+                    <span>{isGu ? '🎨 ૪ OpenArt પ્રોમ્પ્ટ બનાવો' : '🎨 Generate OpenArt Prompts'}</span>
+                  </button>
+
+                  <a
+                    href="https://openart.ai/video"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="min-h-[40px] px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 text-xs font-bold flex items-center gap-1.5 transition"
+                  >
+                    <span>{isGu ? 'OpenArt ખોલો' : 'Open OpenArt AI'}</span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+              </div>
+
+              {openArtScenes.length > 0 && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                  {openArtScenes.map((sc) => (
+                    <div key={sc.sceneNumber} className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-1.5">
+                      <div className="flex items-center justify-between gap-2 text-[11px]">
+                        <span className="font-bold text-amber-300 font-['Noto_Sans_Gujarati',sans-serif]">
+                          #{sc.sceneNumber} {sc.titleGu}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard.writeText(sc.promptEn);
+                            setCopiedOpenArtScene(sc.sceneNumber);
+                            setTimeout(() => setCopiedOpenArtScene(null), 2000);
+                          }}
+                          className="text-sky-400 hover:text-sky-300 font-bold flex items-center gap-1"
+                        >
+                          {copiedOpenArtScene === sc.sceneNumber ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                          <span>{copiedOpenArtScene === sc.sceneNumber ? 'Copied' : 'Copy'}</span>
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-slate-200 font-mono leading-relaxed line-clamp-3">
+                        {sc.promptEn}
+                      </p>
+                      <span className="inline-block text-[10px] text-slate-400">
+                        🎥 {sc.cameraMovement} • {sc.recommendedModel}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Import OpenArt AI Video or Scene Images */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                <label className="min-h-[44px] px-3.5 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-800/80 border border-dashed border-amber-500/50 text-xs font-bold text-amber-200 flex items-center justify-center gap-2 cursor-pointer transition">
+                  <FileVideo className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>{isGu ? '📤 OpenArt વિડિયો (.mp4) લાવો' : '📤 Import OpenArt Video (.mp4)'}</span>
+                  <input type="file" accept="video/*" onChange={handleImportExternalVideoFile} className="hidden" />
+                </label>
+
+                <label className="min-h-[44px] px-3.5 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-800/80 border border-dashed border-sky-500/50 text-xs font-bold text-sky-200 flex items-center justify-center gap-2 cursor-pointer transition">
+                  <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />
+                  <span>
+                    {openArtSlideImageNames.length > 0
+                      ? `${openArtSlideImageNames.length} ચિત્રો લોડ થયા`
+                      : (isGu ? '🖼️ OpenArt ચિત્રો (1-4) લાવો' : '🖼️ Import OpenArt Images (1-4)')}
+                  </span>
+                  <input type="file" accept="image/*" multiple onChange={handleImportOpenArtImages} className="hidden" />
+                </label>
+
+                <button
+                  type="button"
+                  onClick={handleCompileCurrentStudioToMp4}
+                  disabled={isGeneratingAiVideo}
+                  className="min-h-[44px] px-3.5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white text-xs font-bold shadow flex items-center justify-center gap-2 transition disabled:opacity-50 sm:col-span-2 lg:col-span-1"
+                >
+                  <Film className="w-4 h-4 shrink-0" />
+                  <span>{isGu ? '🎬 OpenArt સ્લાઇડ્સ -> MP4 બનાવો' : '🎬 Compile Visuals to MP4'}</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Status Feedback Banners */}
+          {aiVideoStageMsg && (
+            <div className="p-3 rounded-xl bg-sky-950/60 border border-sky-500/40 text-xs text-sky-200 flex items-center gap-2">
+              <Loader2 className="w-4 h-4 animate-spin text-sky-400 shrink-0" />
+              <span>{aiVideoStageMsg}</span>
+            </div>
+          )}
+
+          {aiVideoError && (
+            <div className="p-3 rounded-xl bg-red-950/70 border border-red-500/50 text-xs text-red-200 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+              <span>{aiVideoError}</span>
+            </div>
+          )}
+
+          {aiVideoSuccessMsg && (
+            <div className="p-3 rounded-xl bg-emerald-950/70 border border-emerald-500/50 text-xs text-emerald-200 flex flex-wrap items-center justify-between gap-2">
+              <span>{aiVideoSuccessMsg}</span>
+              {importedExternalVideoName && (
+                <span className="text-[11px] font-mono text-emerald-300">{importedExternalVideoName}</span>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
       {/* VIEW 1: YOUTUBE VIDEO STUDIO (VISUAL SLIDESHOW + AI VOICEOVER) */}
       {activeMediaTab === 'video' && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -1434,45 +2171,81 @@ export const MediaWorkspace: React.FC<MediaWorkspaceProps> = ({
                   </span>
                 </div>
 
-                {/* Aspect Ratio Switch */}
-                <div className="flex items-center gap-1 bg-slate-950 px-2 py-0.5 rounded border border-slate-800 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setAspectRatio('16:9')}
-                    className={`p-1 rounded ${aspectRatio === '16:9' ? 'text-red-400 bg-slate-800' : 'text-slate-500'}`}
-                    title="16:9 YouTube Landscape"
-                  >
-                    <Tv className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAspectRatio('9:16')}
-                    className={`p-1 rounded ${aspectRatio === '9:16' ? 'text-red-400 bg-slate-800' : 'text-slate-500'}`}
-                    title="9:16 Shorts/Reels Vertical"
-                  >
-                    <Smartphone className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAspectRatio('1:1')}
-                    className={`p-1 rounded ${aspectRatio === '1:1' ? 'text-red-400 bg-slate-800' : 'text-slate-500'}`}
-                    title="1:1 Instagram Square"
-                  >
-                    <Square className="w-3.5 h-3.5" />
-                  </button>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {renderedVideoPreviewUrl && (
+                    <div className="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => setPreviewViewMode('rendered_video')}
+                        className={`px-2 py-0.5 rounded font-bold transition ${
+                          previewViewMode === 'rendered_video' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {isGu ? '🎥 MP4 પ્રિવ્યૂ' : '🎥 MP4 Preview'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPreviewViewMode('canvas')}
+                        className={`px-2 py-0.5 rounded font-bold transition ${
+                          previewViewMode === 'canvas' ? 'bg-red-600 text-white' : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {isGu ? 'લાઈવ સ્ટેજ' : 'Live Stage'}
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Aspect Ratio Switch */}
+                  <div className="flex items-center gap-1 bg-slate-950 px-2 py-0.5 rounded border border-slate-800 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setAspectRatio('16:9')}
+                      className={`p-1 rounded ${aspectRatio === '16:9' ? 'text-red-400 bg-slate-800' : 'text-slate-500'}`}
+                      title="16:9 YouTube Landscape"
+                    >
+                      <Tv className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAspectRatio('9:16')}
+                      className={`p-1 rounded ${aspectRatio === '9:16' ? 'text-red-400 bg-slate-800' : 'text-slate-500'}`}
+                      title="9:16 Shorts/Reels Vertical"
+                    >
+                      <Smartphone className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAspectRatio('1:1')}
+                      className={`p-1 rounded ${aspectRatio === '1:1' ? 'text-red-400 bg-slate-800' : 'text-slate-500'}`}
+                      title="1:1 Instagram Square"
+                    >
+                      <Square className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
               </div>
 
-              {/* Live HTML5 Canvas Stage (Ken Burns Slides + Gujarati Lower-Thirds + Anchor Maya PiP) */}
+              {/* Rendered MP4 Preview Player OR Live HTML5 Canvas Stage */}
               <div className="bg-black flex items-center justify-center p-2 sm:p-3">
-                <canvas
-                  ref={stageCanvasRef}
-                  width={aspectRatio === '9:16' ? 720 : aspectRatio === '1:1' ? 900 : 1280}
-                  height={aspectRatio === '9:16' ? 1280 : aspectRatio === '1:1' ? 900 : 720}
-                  className={`w-full rounded-xl border border-slate-800 shadow-2xl object-contain ${
-                    aspectRatio === '9:16' ? 'max-h-[460px] max-w-[280px]' : aspectRatio === '1:1' ? 'max-h-[420px] max-w-[420px]' : 'max-h-[420px]'
-                  }`}
-                />
+                {previewViewMode === 'rendered_video' && renderedVideoPreviewUrl ? (
+                  <video
+                    src={renderedVideoPreviewUrl}
+                    controls
+                    playsInline
+                    className={`w-full rounded-xl border border-emerald-500/40 shadow-2xl bg-black ${
+                      aspectRatio === '9:16' ? 'max-h-[460px] max-w-[280px]' : 'max-h-[420px]'
+                    }`}
+                  />
+                ) : (
+                  <canvas
+                    ref={stageCanvasRef}
+                    width={aspectRatio === '9:16' ? 720 : aspectRatio === '1:1' ? 900 : 1280}
+                    height={aspectRatio === '9:16' ? 1280 : aspectRatio === '1:1' ? 900 : 720}
+                    className={`w-full rounded-xl border border-slate-800 shadow-2xl object-contain ${
+                      aspectRatio === '9:16' ? 'max-h-[460px] max-w-[280px]' : aspectRatio === '1:1' ? 'max-h-[420px] max-w-[420px]' : 'max-h-[420px]'
+                    }`}
+                  />
+                )}
               </div>
 
               {/* Slide Thumbnail Strip (4 Symbolic Visuals matching script paragraphs) */}
